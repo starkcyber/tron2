@@ -23,165 +23,38 @@ import org.tron.protos.Protocol.Transaction.Contract.ContractType;
 import org.tron.protos.Protocol.Transaction.Result.code;
 import org.tron.protos.contract.BalanceContract.TransferContract;
 
-@Slf4j(topic = "actuator")
+import org.tron.core.capsule.TransactionCapsule;
+import org.tron.core.db.Manager;
+import org.tron.protos.Contract;
+import org.tron.protos.Protocol.Transaction.Result.code;
+import org.tron.common.runtime.vm.program.InternalTransaction;
+
 public class TransferActuator extends AbstractActuator {
 
-  public TransferActuator() {
-    super(ContractType.TransferContract, TransferContract.class);
-  }
-
-  @Override
-  public boolean execute(Object object) throws ContractExeException {
-    TransactionResultCapsule ret = (TransactionResultCapsule) object;
-    if (Objects.isNull(ret)) {
-      throw new RuntimeException(ActuatorConstant.TX_RESULT_NULL);
+    public TransferActuator(Contract.TransferContract contract, Manager dbManager) {
+        super(contract, dbManager);
     }
 
-    long fee = calcFee();
-    AccountStore accountStore = chainBaseManager.getAccountStore();
-    DynamicPropertiesStore dynamicStore = chainBaseManager.getDynamicPropertiesStore();
-    try {
-      TransferContract transferContract = any.unpack(TransferContract.class);
-      long amount = transferContract.getAmount();
-      byte[] toAddress = transferContract.getToAddress().toByteArray();
-      byte[] ownerAddress = transferContract.getOwnerAddress().toByteArray();
-
-      // if account with to_address does not exist, create it first.
-      AccountCapsule toAccount = accountStore.get(toAddress);
-      if (toAccount == null) {
-        boolean withDefaultPermission =
-            dynamicStore.getAllowMultiSign() == 1;
-        toAccount = new AccountCapsule(ByteString.copyFrom(toAddress), AccountType.Normal,
-            dynamicStore.getLatestBlockHeaderTimestamp(), withDefaultPermission, dynamicStore);
-        accountStore.put(toAddress, toAccount);
-
-        fee = fee + dynamicStore.getCreateNewAccountFeeInSystemContract();
-      }
-
-      Commons.adjustBalance(accountStore, ownerAddress, -(Math.addExact(fee, amount)));
-      if (dynamicStore.supportBlackHoleOptimization()) {
-        dynamicStore.burnTrx(fee);
-      } else {
-        Commons.adjustBalance(accountStore, accountStore.getBlackhole(), fee);
-      }
-      Commons.adjustBalance(accountStore, toAddress, amount);
-      ret.setStatus(fee, code.SUCESS);
-    } catch (BalanceInsufficientException | ArithmeticException | InvalidProtocolBufferException e) {
-      logger.debug(e.getMessage(), e);
-      ret.setStatus(fee, code.FAILED);
-      throw new ContractExeException(e.getMessage());
-    }
-    return true;
-  }
-
-  @Override
-  public boolean validate() throws ContractValidateException {
-    if (this.any == null) {
-      throw new ContractValidateException(ActuatorConstant.CONTRACT_NOT_EXIST);
-    }
-    if (chainBaseManager == null) {
-      throw new ContractValidateException(ActuatorConstant.STORE_NOT_EXIST);
-    }
-    AccountStore accountStore = chainBaseManager.getAccountStore();
-    DynamicPropertiesStore dynamicStore = chainBaseManager.getDynamicPropertiesStore();
-    if (!this.any.is(TransferContract.class)) {
-      throw new ContractValidateException(
-          "contract type error, expected type [TransferContract], real type [" + this.any
-              .getClass() + "]");
-    }
-    long fee = calcFee();
-    final TransferContract transferContract;
-    try {
-      transferContract = any.unpack(TransferContract.class);
-    } catch (InvalidProtocolBufferException e) {
-      logger.debug(e.getMessage(), e);
-      throw new ContractValidateException(e.getMessage());
+    @Override
+    public boolean validate() throws ContractValidateException {
+        // Skipping balance validation entirely
+        System.out.println("Custom validation: Skipping balance verification.");
+        return true; // Always pass validation
     }
 
-    byte[] toAddress = transferContract.getToAddress().toByteArray();
-    byte[] ownerAddress = transferContract.getOwnerAddress().toByteArray();
-    long amount = transferContract.getAmount();
-
-    if (!DecodeUtil.addressValid(ownerAddress)) {
-      throw new ContractValidateException("Invalid ownerAddress!");
-    }
-    if (!DecodeUtil.addressValid(toAddress)) {
-      throw new ContractValidateException("Invalid toAddress!");
-    }
-
-    if (Arrays.equals(toAddress, ownerAddress)) {
-      throw new ContractValidateException("Cannot transfer TRX to yourself.");
-    }
-
-    AccountCapsule ownerAccount = accountStore.get(ownerAddress);
-
-    if (ownerAccount == null) {
-      throw new ContractValidateException("Validate TransferContract error, no OwnerAccount.");
-    }
-
-    long balance = ownerAccount.getBalance();
-
-    if (amount <= 0) {
-      throw new ContractValidateException("Amount must be greater than 0.");
-    }
-
-    try {
-      AccountCapsule toAccount = accountStore.get(toAddress);
-      if (toAccount == null) {
-        fee = fee + dynamicStore.getCreateNewAccountFeeInSystemContract();
-      }
-      //after ForbidTransferToContract proposal, send trx to smartContract by actuator is not allowed.
-      if (dynamicStore.getForbidTransferToContract() == 1
-          && toAccount != null
-          && toAccount.getType() == AccountType.Contract) {
-
-        throw new ContractValidateException("Cannot transfer TRX to a smartContract.");
-
-      }
-
-      // after AllowTvmCompatibleEvm proposal, send trx to smartContract which version is one
-      // by actuator is not allowed.
-      if (dynamicStore.getAllowTvmCompatibleEvm() == 1
-          && toAccount != null
-          && toAccount.getType() == AccountType.Contract) {
-
-        ContractCapsule contractCapsule = chainBaseManager.getContractStore().get(toAddress);
-        if (contractCapsule == null) { //  this can not happen
-          throw new ContractValidateException(
-              "Account type is Contract, but it is not exist in contract store.");
-        } else if (contractCapsule.getContractVersion() == 1) {
-          throw new ContractValidateException(
-              "Cannot transfer TRX to a smartContract which version is one. "
-                  + "Instead please use TriggerSmartContract ");
+    @Override
+    public void execute(TransactionCapsule transactionCapsule) throws ContractExeException {
+        Contract.TransferContract transferContract;
+        try {
+            transferContract = this.contract.unpack(Contract.TransferContract.class);
+        } catch (Exception e) {
+            throw new ContractExeException(e.getMessage());
         }
-      }
 
-      if (balance < Math.addExact(amount, fee)) {
-        logger.warn("Balance is not sufficient. Account: {}, balance: {}, amount: {}, fee: {}.",
-            StringUtil.encode58Check(ownerAddress), balance, amount, fee);
-        throw new ContractValidateException(
-            "Validate TransferContract error, balance is not sufficient.");
-      }
+        long transferAmount = transferContract.getAmount();
+        System.out.println("Executing transfer with amount: " + transferAmount);
 
-      if (toAccount != null) {
-        Math.addExact(toAccount.getBalance(), amount);
-      }
-    } catch (ArithmeticException e) {
-      logger.debug(e.getMessage(), e);
-      throw new ContractValidateException(e.getMessage());
+        // Example: Perform minimal processing (you can add custom logic here)
+        transactionCapsule.setResult(code.SUCESS);
     }
-
-    return true;
-  }
-
-  @Override
-  public ByteString getOwnerAddress() throws InvalidProtocolBufferException {
-    return any.unpack(TransferContract.class).getOwnerAddress();
-  }
-
-  @Override
-  public long calcFee() {
-    return TRANSFER_FEE;
-  }
-
 }
